@@ -7,12 +7,15 @@ the **env hook** attachment pattern.
 ## What it is
 
 One executable, `env`, run by the engine before every spawn (see "modules" in
-`agent.py`). It polls Claude's OAuth usage endpoint for every login on this
-box — the plain `~/.claude` (`default`) plus one config dir per plan under
+`agent.py`). It polls Claude's OAuth usage endpoint for the logins on this
+box — the plain `~/.claude` (`default`) plus config dirs under
 `~/.clawd-accounts/<name>` — and prints `CLAUDE_CONFIG_DIR=<best>` so the
-child runs on the plan with the most headroom. Usage is TTL-cached on disk
-(`.cache.json`, gitignored), so the common case adds ~0.2s to a turn and a
-cold poll ~2s.
+child runs on the plan with the most headroom. **The org is the usage pool**:
+several dirs logged into the same org share one set of limits, so dirs are
+grouped by `organizationUuid` (read from each dir's `.claude.json`) and only
+one live login per pool is polled; sibling dirs act as fallbacks when that
+login's creds have gone stale. Usage is TTL-cached on disk (`.cache.json`,
+gitignored), so the common case adds ~0.2s to a turn and a cold poll ~2s.
 
 ## What it needs
 
@@ -23,7 +26,9 @@ cold poll ~2s.
 - macOS Keychain or `.credentials.json` per config dir (it reads the same
   credential store Claude Code writes).
 - Knobs: `CLAUDE_P_ROUTER=0` disables; `CLAUDE_P_ROUTER_TTL` (default 600s)
-  cache lifetime; `CLAWD_ACCOUNTS_DIR` overrides the accounts root.
+  cache lifetime; `CLAUDE_P_ROUTER_STALE` (default 3600s) how old a cached
+  reading may be and still be reused when the endpoint flakes;
+  `CLAWD_ACCOUNTS_DIR` overrides the accounts root.
 
 ## Wiring
 
@@ -43,6 +48,12 @@ cat .cache.json                          # per-plan utilization it saw
 
 - The usage endpoint is **undocumented**; any failure (endpoint change, auth,
   network) degrades to "don't route" — turns still run, on the ambient login.
+- The usage endpoint **rate-limits (429)** if polled rapidly (e.g. clearing
+  the cache repeatedly while testing). A flaked poll reuses the last cached
+  reading for up to `CLAUDE_P_ROUTER_STALE`; only then is the login dropped.
+- Org grouping reads `organizationUuid` from each dir's `.claude.json`,
+  falling back to the OAuth profile endpoint (cached in `.cache.json` under
+  `_orgs` — delete the file after re-logging a dir into a different org).
 - It shares the transcript store by symlinking each account dir's `projects/`
   to `~/.claude/projects` so sessions resume under any plan. If you don't
   want cross-plan resume, don't use this module.

@@ -6,7 +6,11 @@ plan under ~/.clawd-accounts/<name>, each signed in ONCE via
     CLAUDE_CONFIG_DIR=~/.clawd-accounts/<name> claude /login
 — every turn runs on the plan with the MOST HEADROOM right now. Usage comes
 from Claude's OAuth usage endpoint (undocumented: every failure degrades to
-"don't route"). The plain ~/.claude login participates as `default`. An
+"don't route"). The ORG is the usage pool: two config dirs logged into the
+same org share one set of limits, so dirs are grouped by organizationUuid
+(from each dir's .claude.json) and only one live login per pool is polled —
+siblings are fallbacks when that login's creds have gone stale. The plain
+~/.claude login participates as `default`. An
 operator-set CLAUDE_CONFIG_DIR always wins (the engine passes the child env
 through; if the pin is present we print nothing). Boxes with no account dirs
 behave exactly as if this module were absent. Disable with CLAUDE_P_ROUTER=0.
@@ -27,11 +31,13 @@ CACHE = os.path.join(HERE, ".cache.json")
 
 ROUTER_ON = os.environ.get("CLAUDE_P_ROUTER", "1") != "0"
 ROUTER_TTL = float(os.environ.get("CLAUDE_P_ROUTER_TTL", "600"))
+ROUTER_STALE = float(os.environ.get("CLAUDE_P_ROUTER_STALE", "3600"))
 ACCOUNTS_DIR = os.path.expanduser(
     os.environ.get("CLAWD_ACCOUNTS_DIR", "~/.clawd-accounts"))
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code's PUBLIC client id (non-secret) — gitleaks:allow
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 OAUTH_BETA = "oauth-2025-04-20"
 
 
@@ -110,6 +116,38 @@ def _usage_pct(config_dir):
     return worst
 
 
+def _org_uuid(config_dir):
+    """The org this login belongs to — two logins to one org share limits."""
+    path = os.path.join(config_dir or os.path.expanduser("~/.claude"),
+                        ".claude.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            acct = json.load(f).get("oauthAccount") or {}
+        return acct.get("organizationUuid") or None
+    except (OSError, ValueError):
+        return None
+
+
+def _org_from_profile(config_dir):
+    """Org discovery fallback when .claude.json doesn't say (e.g. the plain
+    ~/.claude login) — asks the OAuth profile endpoint (undocumented, same
+    degrade-on-failure rules as usage). Result is cached on disk forever;
+    an org only changes on re-login, and deleting .cache.json resets it."""
+    import urllib.request
+    oauth = (_read_creds(config_dir) or {}).get("claudeAiOauth") or {}
+    tok = oauth.get("accessToken")
+    if not tok:
+        return None
+    req = urllib.request.Request(OAUTH_PROFILE_URL, headers={
+        "Authorization": f"Bearer {tok}", "anthropic-beta": OAUTH_BETA})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            org = json.loads(r.read().decode()).get("organization") or {}
+        return org.get("uuid") or None
+    except Exception:
+        return None
+
+
 def _load_cache():
     try:
         with open(CACHE, encoding="utf-8") as f:
@@ -140,19 +178,40 @@ def main():
     if len(candidates) < 2:
         return                                   # nothing to route between
     cache = _load_cache()
+    # Group logins by org — the org is the pool (dirs sharing an org share
+    # limits). Unknown org keeps its own key so it still participates alone.
+    orgs = cache.get("_orgs") if isinstance(cache.get("_orgs"), dict) else {}
+    pools = {}
+    for name, cfg in candidates:
+        key = _org_uuid(cfg) or orgs.get(name)
+        if not key:
+            key = _org_from_profile(cfg)
+            if key:
+                orgs[name] = key
+        pools.setdefault(key or f"dir:{name}", []).append((name, cfg))
+    cache["_orgs"] = orgs
+    if len(pools) < 2:
+        _save_cache(cache)
+        return                                   # many dirs, one actual plan
     now = time.time()
     best_name, best_cfg, best_pct = None, None, None
-    for name, cfg in candidates:
-        c = cache.get(name)
-        if not isinstance(c, dict) or now - c.get("ts", 0) > ROUTER_TTL:
-            pct = _usage_pct(cfg)
-            if pct is None:
-                cache.pop(name, None)
-                continue                         # not signed in / endpoint down
-            c = {"pct": pct, "ts": now}
-            cache[name] = c
-        if best_pct is None or c["pct"] < best_pct:
-            best_name, best_cfg, best_pct = name, cfg, c["pct"]
+    for _key, members in sorted(pools.items()):
+        for name, cfg in members:                # first live login wins the pool
+            c = cache.get(name)
+            if not isinstance(c, dict) or now - c.get("ts", 0) > ROUTER_TTL:
+                pct = _usage_pct(cfg)
+                if pct is not None:
+                    c = {"pct": pct, "ts": now}
+                    cache[name] = c
+                elif isinstance(c, dict) and now - c.get("ts", 0) < ROUTER_STALE:
+                    pass    # endpoint flaked (429/blip) — stale reading beats
+                            # dropping the whole pool; retried on every run
+                else:
+                    cache.pop(name, None)
+                    continue                     # dead creds — try a sibling
+            if best_pct is None or c["pct"] < best_pct:
+                best_name, best_cfg, best_pct = name, cfg, c["pct"]
+            break
     if best_name is None:
         _save_cache(cache)
         return
@@ -171,7 +230,8 @@ def main():
         print("CLAUDE_CONFIG_DIR=")              # empty value = remove the key
     if cache.get("_last") != best_name:
         cache["_last"] = best_name
-        print(f"[router] turns run on plan {best_name!r} ({best_pct:.0f}% used)",
+        print(f"[router] turns run on plan {best_name!r} ({best_pct:.0f}% used)"
+              f" — {len(pools)} pool(s) across {len(candidates)} login(s)",
               file=sys.stderr)
     _save_cache(cache)
 
