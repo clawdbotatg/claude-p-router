@@ -17,6 +17,12 @@ one live login per pool is polled; sibling dirs act as fallbacks when that
 login's creds have gone stale. Usage is TTL-cached on disk (`.cache.json`,
 gitignored), so the common case adds ~0.2s to a turn and a cold poll ~2s.
 
+When it routes it also prints `CLAUDE_P_ROUTER_PLAN=<name>` — a
+self-awareness breadcrumb so the agent (`tools/vitals`) can tell "the router
+chose this plan" apart from "an operator pin / inherited env" (on pinned
+turns the hook prints nothing, so the var's absence means no routing
+happened).
+
 ## What it needs
 
 - Nothing, if you have one login: with fewer than two candidates it does

@@ -228,6 +228,10 @@ def main():
         print(f"CLAUDE_CONFIG_DIR={best_cfg}")
     else:
         print("CLAUDE_CONFIG_DIR=")              # empty value = remove the key
+    # self-awareness breadcrumb: lets tools/vitals distinguish "the router
+    # chose this plan" from "an operator pin / inherited env" (pinned turns
+    # never reach here, so the var's absence means we didn't route)
+    print(f"CLAUDE_P_ROUTER_PLAN={best_name}")
     if cache.get("_last") != best_name:
         cache["_last"] = best_name
         print(f"[router] turns run on plan {best_name!r} ({best_pct:.0f}% used)"
