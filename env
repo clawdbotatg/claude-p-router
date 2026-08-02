@@ -19,6 +19,13 @@ Engine contract (see agent.py "modules"): stdout "KEY=VAL" merges into the
 child env, "KEY=" removes the key; stderr passes through; non-zero exit or
 timeout = ignored. Usage is TTL-cached in .cache.json next to this script
 (a fresh process runs each turn, so the cache lives on disk).
+
+`env --status` is the query surface for EXTERNAL callers (bridges,
+dashboards): one JSON object with per-pool utilization, the login routing
+would pick, and the last usage-endpoint reply (status + Retry-After) so a
+caller can back off instead of re-tripping the endpoint's rate limit. It
+polls (same TTL cache) but never routes, and works even where routing
+wouldn't (single login, operator pin, CLAUDE_P_ROUTER=0).
 """
 import json
 import os
@@ -185,21 +192,21 @@ def _save_cache(cache):
         pass
 
 
-def main():
-    if not ROUTER_ON or os.environ.get("CLAUDE_CONFIG_DIR"):
-        return                                   # off, or operator pinned a dir
-    candidates = [("default", "")]
+def _candidates():
+    """Every login on this box: plain ~/.claude (`default`) + account dirs."""
+    cands = [("default", "")]
     try:
-        candidates += sorted(
+        cands += sorted(
             (d.name, os.path.join(ACCOUNTS_DIR, d.name))
             for d in os.scandir(ACCOUNTS_DIR) if d.is_dir())
     except OSError:
         pass
-    if len(candidates) < 2:
-        return                                   # nothing to route between
-    cache = _load_cache()
-    # Group logins by org — the org is the pool (dirs sharing an org share
-    # limits). Unknown org keeps its own key so it still participates alone.
+    return cands
+
+
+def _pool_map(candidates, cache):
+    """Group logins by org — the org is the pool (dirs sharing an org share
+    limits). Unknown org keeps its own key so it still participates alone."""
     orgs = cache.get("_orgs") if isinstance(cache.get("_orgs"), dict) else {}
     pools = {}
     for name, cfg in candidates:
@@ -210,13 +217,15 @@ def main():
                 orgs[name] = key
         pools.setdefault(key or f"dir:{name}", []).append((name, cfg))
     cache["_orgs"] = orgs
-    if len(pools) < 2:
-        _save_cache(cache)
-        return                                   # many dirs, one actual plan
-    now = time.time()
-    best_name, best_cfg, best_pct = None, None, None
-    for _key, members in sorted(pools.items()):
-        for name, cfg in members:                # first live login wins the pool
+    return pools
+
+
+def _poll_pools(pools, cache, now):
+    """One usage reading per pool — first live login wins, dead creds fall
+    through to a sibling. Returns [(pool_key, name, cfg, pct)] in pool order."""
+    readings = []
+    for key, members in sorted(pools.items()):
+        for name, cfg in members:
             c = cache.get(name)
             if not isinstance(c, dict) or now - c.get("ts", 0) > ROUTER_TTL:
                 pct = _usage_pct(cfg)
@@ -229,12 +238,29 @@ def main():
                 else:
                     cache.pop(name, None)
                     continue                     # dead creds — try a sibling
-            if best_pct is None or c["pct"] < best_pct:
-                best_name, best_cfg, best_pct = name, cfg, c["pct"]
+            readings.append((key, name, cfg, c["pct"]))
             break
-    if best_name is None:
+    return readings
+
+
+def main():
+    if not ROUTER_ON or os.environ.get("CLAUDE_CONFIG_DIR"):
+        return                                   # off, or operator pinned a dir
+    candidates = _candidates()
+    if len(candidates) < 2:
+        return                                   # nothing to route between
+    cache = _load_cache()
+    pools = _pool_map(candidates, cache)
+    if len(pools) < 2:
+        _save_cache(cache)
+        return                                   # many dirs, one actual plan
+    now = time.time()
+    best = min(_poll_pools(pools, cache, now),
+               key=lambda r: r[3], default=None)
+    if best is None:
         _save_cache(cache)
         return
+    _key, best_name, best_cfg, best_pct = best
     if best_cfg:
         # share the transcript store so sessions resume under any plan
         src = os.path.expanduser("~/.claude/projects")
@@ -260,7 +286,36 @@ def main():
     _save_cache(cache)
 
 
+def status():
+    """--status: one JSON object for external callers. Polls like a routing
+    turn (same TTL cache) but never routes; ignores pins and CLAUDE_P_ROUTER
+    so it always reports what it can see."""
+    now = time.time()
+    cache = _load_cache()
+    candidates = _candidates()
+    readings = _poll_pools(_pool_map(candidates, cache), cache, now)
+    _save_cache(cache)
+    best = min(readings, key=lambda r: r[3], default=None)
+    print(json.dumps({
+        "ok": True,
+        "router": ROUTER_ON,
+        "pinned": os.environ.get("CLAUDE_CONFIG_DIR") or None,
+        "logins": len(candidates),
+        "pools": {key: {"login": name, "pct": pct,
+                        "age": round(now - cache.get(name, {}).get("ts", now), 1)}
+                  for key, name, _cfg, pct in readings},
+        "best": {"login": best[1], "pct": best[3]} if best else None,
+        "endpoint": dict(_usage_last),
+    }))
+
+
 if __name__ == "__main__":
+    if "--status" in sys.argv[1:]:
+        try:
+            status()
+        except Exception as e:                   # degrade machine-readably
+            print(json.dumps({"ok": False, "error": str(e)}))
+        sys.exit(0)
     try:
         main()
     except Exception as e:                       # any surprise = don't route

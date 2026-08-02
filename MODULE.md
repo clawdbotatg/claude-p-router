@@ -42,11 +42,37 @@ None beyond `tools/module add` — the engine discovers `env` hooks by
 convention. An operator-set `CLAUDE_CONFIG_DIR` in the environment always
 wins (the hook prints nothing when a pin is present).
 
+## Query surface for external callers — `./env --status`
+
+Anything outside a turn (a bridge's headroom gate, a dashboard) must NOT
+import this file or read `.cache.json` — those are internals. The contract is
+one JSON object on stdout:
+
+```bash
+./env --status
+# {"ok": true, "router": true, "pinned": null, "logins": 3,
+#  "pools": {"<org-uuid>": {"login": "default", "pct": 42.0, "age": 12.3}},
+#  "best": {"login": "work", "pct": 12.0},
+#  "endpoint": {"status": 200, "retry_after": null}}
+```
+
+- `best` — the login routing would pick and its utilization (% used of its
+  most-constrained window); `null` when no pool gave a reading.
+- `endpoint` — the last usage-endpoint reply: `status` is an HTTP code,
+  `"expired"` (local creds expired, endpoint not called), or `null`;
+  `retry_after` echoes a 429's Retry-After seconds. **Back off when you see
+  429** — re-polling just re-trips the limit.
+- It polls through the same TTL cache as routing (cheap to call), never
+  routes, and reports even where routing wouldn't run (single login, pin,
+  `CLAUDE_P_ROUTER=0` — check `router`/`pinned` if you care).
+- On any internal failure it still prints JSON: `{"ok": false, "error": …}`.
+
 ## How to verify
 
 ```bash
 env -u CLAUDE_CONFIG_DIR ./env          # from this dir
 # → prints CLAUDE_CONFIG_DIR=… (or nothing if <2 logins); stderr notes the pick
+./env --status                           # JSON snapshot (see above)
 cat .cache.json                          # per-plan utilization it saw
 ```
 
