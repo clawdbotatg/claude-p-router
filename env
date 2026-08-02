@@ -39,6 +39,7 @@ OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 OAUTH_BETA = "oauth-2025-04-20"
+_usage_last = {"status": None, "retry_after": None}  # last usage-endpoint reply
 
 
 def _keychain_service(config_dir):
@@ -78,16 +79,35 @@ def _usage_pct(config_dir):
     access, refresh = oauth.get("accessToken"), oauth.get("refreshToken")
     if not access:
         return None
+    exp = oauth.get("expiresAt")
+    if isinstance(exp, (int, float)) and exp / 1000 <= time.time() + 60:
+        # Expired: calling usage with a dead token is junk traffic that feeds
+        # the endpoint limiter (which answers 429, not 401, masking the
+        # expiry). Don't refresh from here either — live claude processes
+        # hold the same rotating grant, and a second consumer racing it can
+        # kill the token family; the CLI rewrites fresh creds on its next
+        # real turn, so just report unknown until then.
+        _usage_last.update(status="expired", retry_after=None)
+        return None
 
     def call(tok):
         req = urllib.request.Request(OAUTH_USAGE_URL, headers={
             "Authorization": f"Bearer {tok}", "anthropic-beta": OAUTH_BETA})
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
+                _usage_last.update(status=r.status, retry_after=None)
                 return r.status, json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
+            # The endpoint rate-limits (429 + Retry-After, ~20min observed);
+            # record it so callers can wait it out instead of re-tripping it.
+            try:
+                ra = float(e.headers.get("Retry-After"))
+            except (TypeError, ValueError):
+                ra = None
+            _usage_last.update(status=e.code, retry_after=ra)
             return e.code, None
         except Exception:
+            _usage_last.update(status=None, retry_after=None)
             return None, None
 
     code, usage = call(access)
