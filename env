@@ -243,6 +243,25 @@ def _poll_pools(pools, cache, now):
     return readings
 
 
+def _fallback(candidates, cache):
+    """Every reading came back unknown. On an idle box that is the normal
+    state after ~8h: access tokens expire and nothing refreshes them until a
+    real turn runs, and _usage_pct deliberately won't poll with a dead token.
+    Unknown is not dead — the CLI refreshes its grant on the turn. Not
+    routing here spawns claude on plain ~/.claude, which on a routed box has
+    no login, and the turn dies in a second with "Not logged in". Prefer the
+    login that ran last, else the first account dir holding a refresh token.
+    pct is NaN so callers can tell a guess from a reading."""
+    last = cache.get("_last")
+    accounts = sorted(((n, c) for n, c in candidates if c),
+                      key=lambda nc: nc[0] != last)
+    for name, cfg in accounts:
+        oauth = (_read_creds(cfg) or {}).get("claudeAiOauth") or {}
+        if oauth.get("refreshToken"):
+            return (f"fallback:{name}", name, cfg, float("nan"))
+    return None
+
+
 def main():
     if not ROUTER_ON or os.environ.get("CLAUDE_CONFIG_DIR"):
         return                                   # off, or operator pinned a dir
@@ -257,6 +276,8 @@ def main():
     now = time.time()
     best = min(_poll_pools(pools, cache, now),
                key=lambda r: r[3], default=None)
+    if best is None:
+        best = _fallback(candidates, cache)
     if best is None:
         _save_cache(cache)
         return
@@ -280,7 +301,9 @@ def main():
     print(f"CLAUDE_P_ROUTER_PLAN={best_name}")
     if cache.get("_last") != best_name:
         cache["_last"] = best_name
-        print(f"[router] turns run on plan {best_name!r} ({best_pct:.0f}% used)"
+        used = ("usage unknown, fallback" if best_pct != best_pct
+                else f"{best_pct:.0f}% used")
+        print(f"[router] turns run on plan {best_name!r} ({used})"
               f" — {len(pools)} pool(s) across {len(candidates)} login(s)",
               file=sys.stderr)
     _save_cache(cache)
